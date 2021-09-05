@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "Chip8-CIL": {
+      "commandName": "Project",
+      "commandLineArgs": "C:\\Users\\blaws\\Documents\\chip8\\SLOPES",
+      "nativeDebugging": true
+    }
+  }
+}
