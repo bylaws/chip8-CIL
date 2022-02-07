@@ -66,7 +66,6 @@ namespace Chip8_CIL
             _builder = new(_charHeight * _charWidth);
             _builder.Append(' ', _charWidth * _charHeight);
 
-            _width = width;
             _widthBytes = width / 8;
             _height = height;
 

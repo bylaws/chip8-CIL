@@ -25,12 +25,28 @@
             SecondaryF = 0xf000,
         }
 
-        // These have no params at all
         public enum Secondary0 : ushort
         {
-            Mask = 0x00ff,
-            Clr = 0xe0, // CLeaR screen
-            Rts = 0xee, // ReTurn from Subroutine
+            Mask = 0x00f0,
+            Tertiary0E = 0xe0,
+            Tertiary0F = 0xf0,
+            ScrollDown = 0xc0, // One param in lsnibble
+        }
+
+        public enum Tertiary0E : ushort
+        {
+            Mask = 0x000f,
+            Clr = 0x0, // CLeaR screen
+            Rts = 0xe, // ReTurn from Subroutine
+        }
+
+        public enum Tertiary0F : ushort
+        {
+            Mask = 0x000f,
+            ScrollRight = 0xb, // Scroll right 4px
+            ScrollLeft = 0xc, // Scroll left 4px
+            LowRes = 0xe, // Low Resolution 64 x 32
+            HighRes = 0xf, // High Resolution 128 x 64
         }
 
         // All of these take two registers as params
@@ -64,6 +80,7 @@
             LoadS = 0x18, // Load sound timer with register value
             AddI = 0x1e, // Add register value to index register
             Ldspr = 0x29, // Load index register with the position of the given sprite id
+            LdsprLarge = 0x30, // Load index register with the position of the given 10 byte sprite id
             Bcd = 0x33, // Store the binary coded decimal value of the given register at the memory location pointed to
                         // by the index register
             Stor = 0x55, // Store registers V0 - Vx at the memory location pointed to by the index register

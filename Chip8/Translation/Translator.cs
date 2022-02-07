@@ -1,6 +1,8 @@
 ﻿using Lokad.ILPack;
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
 using System.Reflection.Emit;
 
@@ -12,8 +14,25 @@ namespace Chip8_CIL.Chip8.Translation
         private readonly Logger _logger;
 
         private readonly ModuleBuilder _moduleBuilder;
+        Dictionary<uint, Program> _compilationUnits = new();
 
-        public delegate void ProgramDelegate(ref Register.Context ctx, InstructionHelpers helpers, byte[] memory, ushort[] returnAddressStack);
+        public struct Program
+        {
+            public BitArray CodeSet;
+            public ProgramDelegate TranslatedProg;
+            public uint Hash;
+
+
+            public delegate ushort ProgramDelegate(ref Register.Context ctx, InstructionHelpers helpers, byte[] memory, ushort[] returnAddressStack, BitArray codeSet, ref ushort smcRangeStart, ref ushort smcRangeSize);
+
+            public Program(BitArray codeSet, ProgramDelegate translatedProg, uint hash)
+            {
+                CodeSet = codeSet;
+                TranslatedProg = translatedProg;
+                Hash = hash;
+            }
+        }
+
 
         public Translator(byte[] memory, Logger logger)
         {
@@ -24,20 +43,21 @@ namespace Chip8_CIL.Chip8.Translation
             AssemblyBuilder asmBuilder = AssemblyBuilder.DefineDynamicAssembly(new AssemblyName(Guid.NewGuid().ToString()),
             AssemblyBuilderAccess.Run);
 
-            _moduleBuilder = asmBuilder.DefineDynamicModule("MyDynamicAsm");
+            _moduleBuilder = asmBuilder.DefineDynamicModule("TranslatedDynamicAsm");
         }
 
-        private BlockList DiscoverBlocks(ushort startAddr)
+        private void DiscoverBlocks(ushort startAddr, BlockList blocks)
         {
-            _logger.StartFunction("DiscoverBlocks", Logger.Level.Debug);
-
             Stack<Block> blockWalkingStack = new();
 
-            Block currentBlock = new(startAddr);
+            Block currentBlock = blocks.AddJumpTableEntry(startAddr);
+            if (currentBlock.Finalised)
+                return;
+
             Block potentialNextBlock = null;
 
 
-            BlockList blocks = new(currentBlock);
+//            BlockList blocks = new(currentBlock);
 
 
             Block FindNextEmptyBlock()
@@ -50,6 +70,9 @@ namespace Chip8_CIL.Chip8.Translation
             }
 
             Block GetPotentialNextBlock() => blocks.GetNextBlock((ushort)(currentBlock.EndAddr + 1));
+
+            _logger.StartFunction("DiscoverBlocks", Logger.Level.Debug);
+
 
             while (currentBlock != null)
             {
@@ -77,12 +100,12 @@ namespace Chip8_CIL.Chip8.Translation
                 }
 
                 ushort instrAddr = currentBlock.EndAddr;
-
                 Instruction.Instruction instr = new(_memory, instrAddr);
 
                 _logger.LogTrace("Addr: {0:x} Raw: {1:x}, Primary: {2:}, NNN: {3:x}, N: {4:x}, X: {5:x}, Y: {6:x}, KK: {7:x}",
                     instrAddr, instr.Raw, instr.Primary.ToString(), instr.Param.NNN, instr.Param.N, instr.Param.X, instr.Param.Y, instr.Param.KK);
 
+                blocks.MarkAsCode(instrAddr, instr.Size);
 
                 if (instr.Primary == OpCode.Primary.Call)
                 {
@@ -93,8 +116,8 @@ namespace Chip8_CIL.Chip8.Translation
                     // This treats the call as a block terminator instruction
                     ushort returnTargetAddr = currentBlock.Finalise(instr);
 
-                    // Add the return target of call to the block list and mark it for walking
-                    blockWalkingStack.Push(blocks.AddReturnTarget(returnTargetAddr));
+                    // Add the return table of call to the block list and mark it for walking
+                    blockWalkingStack.Push(blocks.AddJumpTableEntry(returnTargetAddr));
 
                     // If this call target created a new block then walk it, otherwise find a new block to walk
                     if (blocks.AddBlockSuccessor(currentBlock, false, targetAddr, out Block targetBlock))
@@ -120,7 +143,7 @@ namespace Chip8_CIL.Chip8.Translation
                 {
                     ushort instrEndAddr = currentBlock.Finalise(instr);
 
-                    // Will be overwritten for skipping instrs which have their target at instrAddr + 2 * Width
+                    // Will be overwritten for skipping instrs which have their target at instrAddr + size
                     ushort targetAddr = instr.Param.NNN;
 
                     if (instr.IsSkipping())
@@ -148,25 +171,64 @@ namespace Chip8_CIL.Chip8.Translation
             }
 
             _logger.StopFunction();
-            return blocks;
+            return;
 
         }
 
-        // Translates a chip8 subroutine into a c# 'SubroutineDelegate' and caches it in the sub table
-        public ProgramDelegate TranslateProgram(ushort startAddr)
+        const bool Dump = false;
+
+        const bool Smc = true;
+
+        int count = 0;
+
+        private Program TranslateProgram(ushort baseAddr, ushort execAddr, BlockList blocks)
         {
+            if (Smc)
+                DiscoverBlocks(baseAddr, blocks);
 
-            BlockList blocks = DiscoverBlocks(startAddr);
-            //if (Settings.DumpEnabled)
-              //  File.WriteAllText(Settings.GetDumpPathFor(string.Format("PROG.dot", startAddr)), blocks.GetGraphDotString());
+            DiscoverBlocks(execAddr, blocks);
+            if (Dump)
+                File.WriteAllText(@"H:\TRANSLATED_ASSEMBLY.dot", blocks.GetGraphDotString());
 
-            return CilEmitter.Translate(blocks, _moduleBuilder);
+            uint hash = (blocks.Hash() | ((uint)execAddr << 16)) ^ baseAddr;
+
+            if (_compilationUnits.TryGetValue(hash, out Program prog)) {
+                _logger.LogWarning("Hit Cache!");
+                return prog;
+            }
+
+            Program.ProgramDelegate translatedProg = CilEmitter.Translate(blocks, _moduleBuilder, hash, execAddr, Smc);
+            if (Dump)
+                new AssemblyGenerator().GenerateAssembly(_moduleBuilder.Assembly, @"H:\TRANSLATED_ASSEMBLY.dll");
+
+            prog = new(blocks.CodeSet, translatedProg, hash);
+
+            _compilationUnits[prog.Hash] = prog;
+
+            return prog;
         }
 
-        public void DumpAssembly()
+        public void ExecuteProgram(ushort startAddr, ref Register.Context ctx, InstructionHelpers instrHelpers, ushort[] stack)
         {
-            AssemblyGenerator generator = new();
-      //      generator.GenerateAssembly(_moduleBuilder.Assembly, Settings.GetDumpPathFor("TRANSLATED_ASSEMBLY.dll"));
+            ushort execAddr = startAddr;
+
+            BlockList blocks = new();
+
+            do
+            {
+                Program prog = TranslateProgram(startAddr, execAddr, blocks);
+
+                _logger.StartFunction(string.Format("Invoke {0:X}", prog.Hash), Logger.Level.Warning);
+                ushort smcRangeStart = 0;
+                ushort smcRangeSize = 0;
+                execAddr = prog.TranslatedProg.Invoke(ref ctx, instrHelpers, _memory, stack, prog.CodeSet, ref smcRangeStart, ref smcRangeSize);
+                _logger.StopFunction();
+
+                if (Smc)
+                    blocks = new();
+            } while (execAddr != 0);
         }
+
+        
     }
 }

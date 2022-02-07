@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
@@ -7,30 +8,26 @@ namespace Chip8_CIL.Chip8.Translation
 {
     class BlockList
     {
-        private readonly Block _rootBlock;
-
         // Insertions in the middle will generally be infrequent and we only move pointers even when they do happen
         // so a list makes the most sense here
         private readonly List<Block> _blocks;
 
-        // Blocks that can be entered be returned to from a RET instruction, used to generate the return dispatch block
-        private readonly List<Block> _returnTargets = new();
+        // Blocks that can be entered be returned to from a RET instruction or from a JUMPI instruction, used to generate the jump table block
+        private readonly List<Block> _jumpTableEntries = new();
 
-
-        public BlockList(Block rootBlock)
+        public BlockList()
         {
-            _rootBlock = rootBlock;
-            _blocks = new() { rootBlock };
+            _blocks = new() { };
         }
 
-        public ushort GetStartAddr() => _rootBlock.StartAddr;
+        public readonly BitArray CodeSet = new(Chip8System.MemorySize);
 
-        public ushort GetLastReturnTargetAddr() =>
-            _returnTargets.Count != 0 ? _returnTargets[_returnTargets.Count - 1].StartAddr : (ushort)0;
+        public ushort GetLastJumpTableEntryAddr() =>
+            _jumpTableEntries.Count != 0 ? _jumpTableEntries[^1].StartAddr : (ushort)0;
 
         // Binary searches for the first block with an address that is >= addr
         // Returns true if the block at the returned lower bound contains the given address
-        int LowerBound(List<Block> list, ushort addr)
+        private int LowerBound(List<Block> list, ushort addr)
         {
             int lower = 0;
             int count = list.Count;
@@ -54,9 +51,9 @@ namespace Chip8_CIL.Chip8.Translation
             return lower;
         }
 
-        int LowerBoundBlock(ushort addr) => LowerBound(_blocks, addr);
+        private int LowerBoundBlock(ushort addr) => LowerBound(_blocks, addr);
 
-        int LowerBoundReturnTarget(ushort addr) => LowerBound(_returnTargets, addr);
+        private int LowerBoundJumpTableEntry(ushort addr) => LowerBound(_jumpTableEntries, addr);
 
         public Block GetNext(List<Block> list, ushort addr)
         {
@@ -69,9 +66,9 @@ namespace Chip8_CIL.Chip8.Translation
 
         public Block GetNextBlock(ushort addr) => GetNext(_blocks, addr);
 
-        public Block GetNextReturnTarget(ushort addr) => GetNext(_returnTargets, addr);
+        public Block GetNextJumpTableEntry(ushort addr) => GetNext(_jumpTableEntries, addr);
 
-        // Adds a successor at the given address to the block splitting and linkign as necessary
+        // Adds a successor at the given address to the block splitting and linking as necessary
         // predecessorBlock MUST be finalised when calling this
         // Returns true if a new, zero length, block was inserted and false if an existing block was updated/split
         public bool AddBlockSuccessor(Block predecessorBlock, bool conditional, ushort successorAddr, out Block successorBlock)
@@ -101,7 +98,10 @@ namespace Chip8_CIL.Chip8.Translation
                     _blocks.Insert(lowerBoundIdx, successorBlock);
                 }
 
-                predecessorBlock.AddBranch(conditional, successorBlock);
+                if (successorBlock == predecessorBlock)
+                    successorBlock.AddBranch(conditional, successorBlock);
+                else
+                    predecessorBlock.AddBranch(conditional, successorBlock);
 
                 return false;
             }
@@ -120,7 +120,7 @@ namespace Chip8_CIL.Chip8.Translation
             }
         }
 
-        public Block AddReturnTarget(ushort addr)
+        public Block AddJumpTableEntry(ushort addr)
         {
             // Check for an existing block first
             int blockLowerBoundIdx = LowerBoundBlock(addr);
@@ -138,28 +138,18 @@ namespace Chip8_CIL.Chip8.Translation
 
 
             // Add it to the sorted return target list
-            int returnTargetLowerBoundIdx = LowerBoundReturnTarget(addr);
+            int jumpTableLowerBoundIdx = LowerBoundJumpTableEntry(addr);
 
-            _returnTargets.Insert(returnTargetLowerBoundIdx, targetBlock);
+            _jumpTableEntries.Insert(jumpTableLowerBoundIdx, targetBlock);
 
             return targetBlock;
         }
 
-        public void DispatchPostOrder(Action<Block> visitor, Block block, HashSet<ushort> visited)
-        {
-            if (block == null || visited.Contains(block.StartAddr))
-                return;
-
-            visited.Add(block.StartAddr);
-
-            DispatchPostOrder(visitor, block.ConditionalSuccessor, visited);
-
-            DispatchPostOrder(visitor, block.Successor, visited);
-
-            visitor(block);
+        public void MarkAsCode(ushort addr, ushort size)
+        { 
+            for (ushort i = addr; i < addr + size; i++)
+                CodeSet.Set(i, true);   
         }
-
-        public void DispatchPostOrder(Action<Block> visitor) => DispatchPostOrder(visitor, _rootBlock, new());
 
         public void DispatchLinear(Action<Block> visitor)
         {
@@ -167,16 +157,31 @@ namespace Chip8_CIL.Chip8.Translation
                 visitor(block);
         }
 
+        public ushort Hash()
+        {
+            ushort val = 0;
+            void HashBlock(Block block) => val ^= block.Hash();
+            DispatchLinear(HashBlock);
+            return val;
+        }
+
         public string GetGraphDotString()
         {
-            void Visitor(Block block) => block.FillInUsageInfo();
-            DispatchLinear(Visitor);
 
-            string BlockDesc(Block block) => string.Format("0x{0:X}\\n\\nRead: {1}\\n Clobbered: {2}\\n Changed: {3}", block.StartAddr,
-                block.RegisterUsageInfo.Read, block.RegisterUsageInfo.Clobbered, block.RegisterUsageInfo.Changed);
+            string BlockDesc(Block block)
+            {
+                if (block.TerminatingInstr.Primary == OpCode.Primary.Call)
+                    return string.Format("0x{0:X}\ncall 0x{1:X}", block.StartAddr, block.TerminatingInstr.Param.NNN);
+                else if (block.TerminatingInstr.Primary == OpCode.Primary.Jump)
+                    return string.Format("0x{0:X}\njump 0x{1:X}", block.StartAddr, block.TerminatingInstr.Param.NNN);
+                else if (block.TerminatingInstr.Primary == OpCode.Primary.Jumpi)
+                    return string.Format("0x{0:X}\njumpi 0x{1:X} + V0", block.StartAddr, block.TerminatingInstr.Param.NNN);
+                else
+                    return string.Format("0x{0:X}", block.StartAddr);
+            }
 
 
-            StringBuilder sb = new(_blocks.Count * 80);
+                StringBuilder sb = new(_blocks.Count * 80);
 
             sb.Append("digraph {\n");
             sb.Append(" splines=\"ortho\"\n");
@@ -185,26 +190,68 @@ namespace Chip8_CIL.Chip8.Translation
 
             sb.Append(" node [shape=box, height=0.5, fontname=\"monospace\"]\n");
 
-            // Add root block to top with styling
-            sb.AppendFormat(" {0} [fillcolor=\"grey\" style=filled, label=\"{1}\"]\n", _rootBlock.StartAddr,
-                BlockDesc(_rootBlock));
-
             void PrintVisitor(Block block)
             {
-                if (block != _rootBlock)
-                    sb.AppendFormat(" {0} [fillcolor=\"white\" style=filled, label=\"{1}\"]\n", block.StartAddr,
-                        BlockDesc(block));
+                if (block.Successor != null || block.ConditionalSuccessor != null)
+                {
+                    if (block.Predecessors.Count == 0)
+                        sb.AppendFormat(" {0} [fillcolor=\"green\" style=filled, label=\"{1}\"]\n", block.StartAddr,
+                            BlockDesc(block));
+                    else
+                        sb.AppendFormat(" {0} [fillcolor=\"white\" style=filled, label=\"{1}\"]\n", block.StartAddr,
+                            BlockDesc(block));
 
-                if (block.Successor != null)
-                    sb.AppendFormat(" {0} -> {1} [taillabel=\"U\",color=green]\n", block.StartAddr,
-                         block.Successor.StartAddr);
+                    if (block.Successor != null)
+                        sb.AppendFormat(" {0} -> {1} [taillabel=\"U\",color=green]\n", block.StartAddr,
+                             block.Successor.StartAddr);
 
-                if (block.ConditionalSuccessor != null)
-                    sb.AppendFormat(" {0} -> {1} [taillabel=\"C\",color=blue]\n", block.StartAddr,
-                        block.ConditionalSuccessor.StartAddr);
+                    if (block.ConditionalSuccessor != null)
+                        sb.AppendFormat(" {0} -> {1} [taillabel=\"C\",color=blue]\n", block.StartAddr,
+                            block.ConditionalSuccessor.StartAddr);
+                }
+                else
+                {
+                    string Colour(Instruction.Instruction instr)
+                    {
+                        switch (instr.Primary)
+                        {
+                            case OpCode.Primary.Jumpi:
+                                return "blue";
+                            case OpCode.Primary.Secondary0:
+                                {
+                                    OpCode.Secondary0 secondary = (OpCode.Secondary0)(instr.Raw & (ushort)OpCode.Secondary0.Mask);
+
+                                    switch (secondary)
+                                    {
+                                        case OpCode.Secondary0.Tertiary0E:
+                                            {
+                                                OpCode.Tertiary0E tertiary = (OpCode.Tertiary0E)(instr.Raw & (ushort)OpCode.Tertiary0E.Mask);
+
+                                                switch (tertiary)
+                                                {
+                                                    case OpCode.Tertiary0E.Rts:
+                                                        return "yellow";
+                                                    default:
+                                                        return "grey";
+                                                }
+                                            }
+                                        default:
+                                            return "grey";
+                                    }
+                                }
+                            default:
+                                return "grey";
+                        }
+                    }
+
+                    sb.AppendFormat(" {0} [fillcolor=\"{2}\" style=filled, label=\"{1}\"]\n", block.StartAddr, 
+                        BlockDesc(block), Colour(block.TerminatingInstr));
+                }
+
+
             }
 
-            DispatchPostOrder(PrintVisitor);
+            DispatchLinear(PrintVisitor);
 
             sb.Append("}\n");
 

@@ -10,7 +10,6 @@ namespace Chip8_CIL.Chip8
         private readonly Logger _logger;
 
         private int _resScale = 1;
-        private bool _extendedMode = false;
         private byte[,] _frameBuffer = new byte[Chip8System.ScreenWidthBytes, Chip8System.ScreenHeight];
 
         internal InstructionHelpers(byte[] memory, IChip8SystemCallbacks callbacks, Logger logger)
@@ -31,7 +30,7 @@ namespace Chip8_CIL.Chip8
 
         private bool BlitByte(int bitX, int byte0X, int byte1X, int y, ushort data)
         {
-            int spriteRowY = y % Chip8System.ScreenHeight;
+            int spriteRowY = y % (Chip8System.ScreenHeight * _resScale);
 
             // Shifts the sprite to handle pixel-level granularity
             byte byte0SpriteData = (byte)(data >> bitX);
@@ -66,16 +65,15 @@ namespace Chip8_CIL.Chip8
             bool flag = false;
             int spriteBitX = x & 0b111;
             int spriteByte0X = x / 8;
-            int spriteByte1X = (spriteByte0X + 1) % Chip8System.ScreenWidthBytes;
+            int spriteByte1X = (spriteByte0X + 1) % (Chip8System.ScreenWidthBytes * _resScale);
 
             // Render 16x16 sprite
-            if (size == 0 && _extendedMode)
+            if (size == 0)
             {
-                int spriteByte2X = (spriteByte1X + 1) % Chip8System.ScreenWidthBytes;
-                flag = BlitByte(spriteBitX, spriteByte0X, spriteByte1X, y, _memory[addr]) ||
-                       BlitByte(spriteBitX, spriteByte1X, spriteByte2X, y, _memory[addr + 1]) ||
-                       BlitByte(spriteBitX, spriteByte0X, spriteByte1X, y + 1, _memory[addr + 2]) ||
-                       BlitByte(spriteBitX, spriteByte1X, spriteByte2X, y + 1, _memory[addr + 3]);
+                int spriteByte2X = (spriteByte1X + 1) % (Chip8System.ScreenWidthBytes * _resScale);
+                for (byte row = 0; row < 16; row++)
+                    flag = BlitByte(spriteBitX, spriteByte0X, spriteByte1X, y + row, _memory[addr + row * 2]) ||
+                           BlitByte(spriteBitX, spriteByte1X, spriteByte2X, y + row, _memory[addr + 1 + row * 2]) || flag;
 
             }
             else
@@ -93,15 +91,50 @@ namespace Chip8_CIL.Chip8
             return flag ? 1 : 0;
         }
 
+        public void EnterHiRes()
+        {
+            _resScale = 2;
+            _frameBuffer = new byte[Chip8System.ScreenWidthBytes * _resScale, Chip8System.ScreenHeight * _resScale];
+            _callbacks.InitialiseFramebuffer(Chip8System.ScreenWidth * _resScale, Chip8System.ScreenHeight * _resScale);
+        }
+        public void EnterLoRes()
+        {
+            _resScale = 1;
+            _frameBuffer = new byte[Chip8System.ScreenWidthBytes * _resScale, Chip8System.ScreenHeight * _resScale];
+            _callbacks.InitialiseFramebuffer(Chip8System.ScreenWidth * _resScale, Chip8System.ScreenHeight * _resScale);
+        }
+        public void ScrollDown()
+        {
+            int lines = 4;
+            lines /= 2;
+            for (int line = 0; line < lines; line++)
+            {
+                for (int i = (Chip8System.ScreenHeight * _resScale) - 1; i > 0; i--)
+                {
+                    for (int j = 0; j < (Chip8System.ScreenWidthBytes * _resScale); j++)
+                    {
+                        _frameBuffer[j, i] = _frameBuffer[j, i - 1];
+                    }
+                }
+
+                for (int j = 0; j < (Chip8System.ScreenWidthBytes * _resScale); j++)
+                {
+                    _frameBuffer[j, 0] = 0;
+                }
+            }
+
+            _callbacks.BlitFramebuffer(_frameBuffer);
+        }
 
         // Checks if the key corresponding to the chip8 keycode 'key' is pressed
         public bool IsKeyPressed(byte key)
         {
             _callbacks.UpdateState();
 
-            _logger.LogVerbose("Check key state: {0:x}");
+            bool pressed = _callbacks.IsKeyPressed((KeyCode)key);
+            _logger.LogVerbose("Check key: {0:x}, pressed: {1}", key, pressed);
 
-            return _callbacks.IsKeyPressed((KeyCode)key);
+            return pressed;
         }
 
         // Waits until a key is pressed and returns its chip8 keycode
@@ -117,6 +150,8 @@ namespace Chip8_CIL.Chip8
         public void SetDelayTimer(byte newTicks) => _callbacks.DelayTimer = newTicks;
 
         public byte GetDelayTimer() => _callbacks.DelayTimer;
+
+        public void SetSoundTimer(byte newTicks) => _callbacks.SoundTimer = newTicks;
 
         // Prints a single byte for debugging translated code (much easier than doing string stuff for the Console API)
         public void PrintDebugByte(byte b)

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Security.Cryptography;
 
 namespace Chip8_CIL.Chip8.Translation
 {
@@ -20,10 +21,6 @@ namespace Chip8_CIL.Chip8.Translation
         public Instruction.Instruction TerminatingInstr { get; private set; }
 
         private readonly List<Instruction.Instruction> _instrs = new();
-
-        public Register.UsageInfo RegisterUsageInfo = new();
-        public Register.Set EntryLoads = new();
-        public Register.Set ExitSaves = new();
 
         public Block(ushort startAddr)
         {
@@ -46,10 +43,14 @@ namespace Chip8_CIL.Chip8.Translation
             TerminatingInstr = terminatingInstr;
         }
 
-        public void DispatchInstructions(Action<Instruction.Instruction> visitor)
+        public void DispatchInstructions(Action<Instruction.Instruction, ushort> visitor)
         {
+            ushort addr = StartAddr;
             foreach (Instruction.Instruction instr in _instrs)
-                visitor(instr);
+            {
+                visitor(instr, addr);
+                addr += instr.Size;
+            }
         }
 
         // Checks if a block is completely empty and contains nothing
@@ -80,6 +81,15 @@ namespace Chip8_CIL.Chip8.Translation
             Finalised = true;
 
             return EndAddr;
+        }
+
+        public ushort Hash()
+        {
+            ushort val = 0;
+            void HashInstr(Instruction.Instruction instr, ushort addr) => val ^= instr.Raw;
+
+            DispatchInstructions(HashInstr);
+            return val;
         }
 
         // Splits this block into two at the given offset, returning the new block
@@ -130,36 +140,6 @@ namespace Chip8_CIL.Chip8.Translation
                 Successor = successor;
 
             successor.Predecessors.Add(this);
-        }
-
-        public void FillInUsageInfo()
-        {
-            void Visitor(Instruction.Instruction instr)
-            {
-                Register.UsageInfo instrUsage = instr.GetRegisterUsageInfo();
-
-                // As we do clobbers on a block level we can't clobber registers that have been read earlier in the block,
-                // otherwise registers that should be saved might not be saved before entering the block
-                Register.Set unchangedUnreadClobbers = instrUsage.Clobbered & ~RegisterUsageInfo.Changed &
-                    ~RegisterUsageInfo.Read;
-                RegisterUsageInfo.Clobbered |= unchangedUnreadClobbers;
-
-                // If a register has been changed then it has implicitly been read,
-                // if a register has been clobbered the read doesn't need to be tracked
-                Register.Set unchangedUnclobberedRead = instrUsage.Read & ~RegisterUsageInfo.Changed &
-                    ~RegisterUsageInfo.Clobbered;
-                RegisterUsageInfo.Read |= unchangedUnclobberedRead;
-
-                // Changes don't need to be tracked to clobbered registers
-                Register.Set unclobberedChanged = instrUsage.Changed & ~RegisterUsageInfo.Clobbered;
-                RegisterUsageInfo.Changed |= unclobberedChanged;
-            }
-
-            DispatchInstructions(Visitor);
-            Visitor(TerminatingInstr);
-
-            EntryLoads = RegisterUsageInfo.Changed | RegisterUsageInfo.Read;
-            ExitSaves = RegisterUsageInfo.Clobbered | RegisterUsageInfo.Changed;
         }
     }
 }

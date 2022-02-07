@@ -4,6 +4,8 @@
     {
         byte DelayTimer { get; set; }
 
+        byte SoundTimer { get; set; }
+
         void InitialiseFramebuffer(int width, int height);
 
         void BlitFramebuffer(byte[,] framebuffer);
@@ -13,6 +15,7 @@
         bool IsKeyPressed(KeyCode key);
 
         KeyCode WaitKey();
+
 
         void UpdateState();
     }

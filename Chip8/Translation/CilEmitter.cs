@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
@@ -11,29 +12,46 @@ namespace Chip8_CIL.Chip8.Translation
         private class Context
         {
             private readonly BlockList _blocks;
+            private readonly bool _fortifySmc;
+            private readonly ushort _executeStartAddr;
 
             private readonly CIL.TypeBuilder _typeBuilder;
             private readonly CIL.MethodBuilder _method;
             private readonly CIL.ILGenerator _generator;
             private readonly CIL.Label _returnDispatcher;
+            private readonly CIL.Label _jumpTable;
             private readonly CIL.Label _errorHandler;
+            private readonly CIL.Label _restartTerminator;
+            private readonly CIL.Label _executeStartLabel;
+            private bool _executeStartLabelMarked;
 
             private readonly int[] _registerLocalIds;
+            private readonly int _tmpLocalId;
+            private readonly int _smcPendingLocalId;
+
+
 
             // Branch targets and their corresponding CIL labels 
             private readonly Dictionary<Block, CIL.Label> _labelMap = new();
 
-            public Context(string name, BlockList blocks, CIL.ModuleBuilder moduleBuilder)
+            public Context(string name, BlockList blocks, CIL.ModuleBuilder moduleBuilder, ushort executeStartAddr, bool fortifySmc)
             {
                 _blocks = blocks;
+                _fortifySmc = fortifySmc;
+                _executeStartAddr = executeStartAddr;
 
                 _typeBuilder = moduleBuilder.DefineType(name, TypeAttributes.Public);
+                // context, instrHelpers, memory, stack, codeSet, smcRangeStart, smcRangeSize
                 _method = _typeBuilder.DefineMethod(name, MethodAttributes.Public | MethodAttributes.Static,
-                    typeof(void), new Type[] { typeof(Register.Context).MakeByRefType(), typeof(InstructionHelpers),
-                                               typeof(byte[]), typeof(ushort[]) });
+                    typeof(ushort), new Type[] { typeof(Register.Context).MakeByRefType(), typeof(InstructionHelpers),
+                                                 typeof(byte[]), typeof(ushort[]), typeof(BitArray), 
+                                                 typeof(ushort).MakeByRefType(),  typeof(ushort).MakeByRefType() });
                 _generator = _method.GetILGenerator();
                 _returnDispatcher = _generator.DefineLabel();
                 _errorHandler = _generator.DefineLabel();
+                _restartTerminator = _generator.DefineLabel();
+                _jumpTable = _generator.DefineLabel();
+                _executeStartLabel = _generator.DefineLabel();
 
                 _registerLocalIds = new int[(int)Register.Id.RegisterCount]; // Index corresponds to Register.Id number
 
@@ -44,6 +62,9 @@ namespace Chip8_CIL.Chip8.Translation
 
                     EmitReadRegisterFromCtx(i);
                 }
+
+                _tmpLocalId = _generator.DeclareLocal(typeof(ushort)).LocalIndex;
+                _smcPendingLocalId = _generator.DeclareLocal(typeof(bool)).LocalIndex;
             }
 
             // Returns the CIL local ID for the given register ID
@@ -95,7 +116,115 @@ namespace Chip8_CIL.Chip8.Translation
             // Stack state:
             // X < Top
             private void EmitLoadReturnAddressStack() =>
-                _generator.Emit(CIL.OpCodes.Ldarg_3); // Load memory argument
+                _generator.Emit(CIL.OpCodes.Ldarg_3); // Load RAS argument
+
+            private void EmitStoreSmcRangeStart()
+            {
+                _generator.Emit(CIL.OpCodes.Ldarg, 5);
+                _generator.Emit(CIL.OpCodes.Stind_I2);
+            }
+
+            private void EmitStoreSmcRangeSize()
+            {
+                _generator.Emit(CIL.OpCodes.Ldarg, 6);
+                _generator.Emit(CIL.OpCodes.Stind_I2);
+            }
+
+            private void EmitLoadSmcRangeStart()
+            {
+                _generator.Emit(CIL.OpCodes.Ldarg, 5);
+                _generator.Emit(CIL.OpCodes.Ldind_I2);
+            }
+
+            private void EmitLoadSmcRangeSize()
+            {
+                _generator.Emit(CIL.OpCodes.Ldarg, 6);
+                _generator.Emit(CIL.OpCodes.Ldind_I2);
+            }
+
+            // Stack in:
+            // Addr
+            // Stack out:
+            // Addr (passthrough)
+            private void EmitSmcFortification()
+            {
+                if (!_fortifySmc)
+                    return;
+
+                _generator.Emit(CIL.OpCodes.Dup);
+                _generator.Emit(CIL.OpCodes.Stloc, _tmpLocalId);
+
+                // if (arg4.get_Item(smcAddress))
+                // {
+                //     if (!smcPending)
+                //         smcRangeStart = smcAddress
+                //
+                //     smcRangeLength +=1
+                // }
+                _generator.Emit(CIL.OpCodes.Ldarg, 4); // Load code set
+                _generator.Emit(CIL.OpCodes.Ldloc, _tmpLocalId); // Load address to check
+
+                // If address is a code address 1 will be pushed onto the stack after this
+                _generator.Emit(CIL.OpCodes.Callvirt, typeof(BitArray).GetMethod("get_Item"));
+
+                CIL.Label notSmcLabel = _generator.DefineLabel();
+                _generator.Emit(CIL.OpCodes.Brfalse, notSmcLabel);
+
+
+                // if (!smcPending)
+                //     smcRangeStart = smcAddress
+                _generator.Emit(CIL.OpCodes.Ldloc, _smcPendingLocalId);
+
+                CIL.Label skipSetSmcStartLabel = _generator.DefineLabel();
+                _generator.Emit(CIL.OpCodes.Brtrue, skipSetSmcStartLabel);
+
+                // smcPending = true
+                _generator.Emit(CIL.OpCodes.Ldc_I4_1);
+                _generator.Emit(CIL.OpCodes.Stloc, _smcPendingLocalId);
+
+                // smcRangeStart = smcAddress
+                _generator.Emit(CIL.OpCodes.Ldarg, 5); // Store to range start
+                _generator.Emit(CIL.OpCodes.Ldloc, _tmpLocalId); // Load address to add to range
+                _generator.Emit(CIL.OpCodes.Stind_I2); // Store to range
+
+                _generator.MarkLabel(skipSetSmcStartLabel);
+
+                // smcRangeSize += 1
+                _generator.Emit(CIL.OpCodes.Ldarg, 6); // Load range
+                _generator.Emit(CIL.OpCodes.Dup);
+                _generator.Emit(CIL.OpCodes.Ldind_I2); // Load from range
+                _generator.Emit(CIL.OpCodes.Ldc_I4_1);
+                _generator.Emit(CIL.OpCodes.Add);
+                _generator.Emit(CIL.OpCodes.Stind_I2); // Store to range
+
+
+                _generator.MarkLabel(notSmcLabel);
+            }   
+
+            // Stack in:
+            // Address < Top
+            private void EmitRestartTerminator()
+            {
+                _generator.MarkLabel(_restartTerminator);
+
+                for (Register.Id i = 0; i < Register.Id.RegisterCount; i++)
+                    EmitWriteRegisterToCtx(i);
+
+                _generator.Emit(CIL.OpCodes.Ret);
+            }
+
+            private void EmitSmcRestartCall(ushort resumeAddress)
+            {
+                if (!_fortifySmc)
+                    return;
+
+                _generator.Emit(CIL.OpCodes.Ldc_I4, resumeAddress);
+                _generator.Emit(CIL.OpCodes.Ldloc, _smcPendingLocalId);
+                _generator.Emit(CIL.OpCodes.Brtrue, _restartTerminator);
+
+                // Pop resume address off stack if we didn't need to restart
+                _generator.Emit(CIL.OpCodes.Pop); 
+            }
 
             // Sets a register to a constant value
             private void EmitSetRegisterValue(Register.Id id, ushort constant)
@@ -124,8 +253,14 @@ namespace Chip8_CIL.Chip8.Translation
                 EmitStoreRegister(x);
             }
 
-            void InstructionVisitor(Instruction.Instruction instr)
+            void InstructionVisitor(Instruction.Instruction instr, ushort addr)
             {
+                if (addr == _executeStartAddr && !_executeStartLabelMarked)
+                {
+                    _generator.MarkLabel(_executeStartLabel);
+                    _executeStartLabelMarked = true;
+                }
+
                 switch (instr.Primary)
                 {
                     case OpCode.Primary.Secondary0:
@@ -134,11 +269,57 @@ namespace Chip8_CIL.Chip8.Translation
 
                             switch (secondary)
                             {
-                                case OpCode.Secondary0.Clr: // clear()
-                                    EmitLoadInstructionHelpers();
-                                    _generator.Emit(CIL.OpCodes.Call, typeof(InstructionHelpers).GetMethod("Clear"));
+                                case OpCode.Secondary0.Tertiary0E:
+                                    {
+                                        OpCode.Tertiary0E tertiary = (OpCode.Tertiary0E)(instr.Raw & (ushort)OpCode.Tertiary0E.Mask);
+
+                                        switch (tertiary)
+                                        {
+                                            case OpCode.Tertiary0E.Clr: // clear()
+                                                EmitLoadInstructionHelpers();
+                                                _generator.Emit(CIL.OpCodes.Call, typeof(InstructionHelpers).GetMethod("Clear"));
+                                                break;
+                                            default:
+
+                                                Debug.Assert(false);
+
+                                                break;
+                                        }
+                                    }
                                     break;
+                                case OpCode.Secondary0.Tertiary0F:
+                                    {
+                                        OpCode.Tertiary0F tertiary = (OpCode.Tertiary0F)(instr.Raw & (ushort)OpCode.Tertiary0F.Mask);
+
+                                        switch (tertiary)
+                                        {
+                                            case OpCode.Tertiary0F.HighRes: // hires()
+                                                EmitLoadInstructionHelpers();
+                                                _generator.Emit(CIL.OpCodes.Call, typeof(InstructionHelpers).GetMethod("EnterHiRes"));
+                                                break;
+                                            case OpCode.Tertiary0F.LowRes: // lores()
+                                                EmitLoadInstructionHelpers();
+                                                _generator.Emit(CIL.OpCodes.Call, typeof(InstructionHelpers).GetMethod("EnterLoRes"));
+                                                break;
+                                            default:
+                                                Debug.Assert(false);
+
+                                                break;
+                                        }
+                                    }
+                                    break;
+                                case OpCode.Secondary0.ScrollDown: // scrollDown(K)
+                                    {
+                                        byte lines = (byte)((byte)instr.Raw & 0xf);
+
+                                        EmitLoadInstructionHelpers();
+                                        //_generator.Emit(CIL.OpCodes.Ldc_I4, (int)lines);
+                                        _generator.Emit(CIL.OpCodes.Call, typeof(InstructionHelpers).GetMethod("ScrollDown"));
+                                        break;
+                                    }
                                 default:
+                                    Debug.Assert(false);
+
                                     break;
                             }
                         }
@@ -276,6 +457,8 @@ namespace Chip8_CIL.Chip8.Translation
                                     EmitStoreRegister(Register.Id.VFRegister); // VF = VY >> 7
                                     break;
                                 default:
+                                    Debug.Assert(false);
+
                                     break;
                             }
                         }
@@ -327,8 +510,10 @@ namespace Chip8_CIL.Chip8.Translation
                                     EmitLoadRegister(instr.Param.X);
                                     _generator.Emit(CIL.OpCodes.Call, typeof(InstructionHelpers).GetMethod("SetDelayTimer"));
                                     break;
-                                case OpCode.SecondaryF.LoadS:
-                                    Debug.Assert(false);
+                                case OpCode.SecondaryF.LoadS: // ST = VX
+                                    EmitLoadInstructionHelpers();
+                                    EmitLoadRegister(instr.Param.X);
+                                    _generator.Emit(CIL.OpCodes.Call, typeof(InstructionHelpers).GetMethod("SetSoundTimer"));
                                     break;
                                 case OpCode.SecondaryF.AddI: // I = I + VX
                                     EmitLoadRegisterPair(Register.Id.IRegister, instr.Param.X);
@@ -344,6 +529,14 @@ namespace Chip8_CIL.Chip8.Translation
                                     _generator.Emit(CIL.OpCodes.Mul);
                                     EmitStoreRegister(Register.Id.IRegister);
                                     break;
+                                case OpCode.SecondaryF.LdsprLarge: // I = FONT_LARGE[X]
+                                    EmitLoadRegister(instr.Param.X);
+                                    _generator.Emit(CIL.OpCodes.Ldc_I4, 0x50);
+                                    _generator.Emit(CIL.OpCodes.Add);
+                                    _generator.Emit(CIL.OpCodes.Ldc_I4, 10);
+                                    _generator.Emit(CIL.OpCodes.Mul);
+                                    EmitStoreRegister(Register.Id.IRegister);
+                                    break;
                                 case OpCode.SecondaryF.Bcd: // MEM[I] = VX / 100
                                                             // MEM[I + 1] = (VX / 10) % 10
                                                             // MEM[I + 2] = (VX % 10)
@@ -355,6 +548,8 @@ namespace Chip8_CIL.Chip8.Translation
 
                                     // Load target address
                                     EmitLoadRegister(Register.Id.IRegister);
+
+                                    EmitSmcFortification();
 
                                     // Calculate BCD byte 0
                                     EmitLoadRegister(instr.Param.X);
@@ -369,6 +564,8 @@ namespace Chip8_CIL.Chip8.Translation
                                     _generator.Emit(CIL.OpCodes.Ldc_I4, 1);
                                     _generator.Emit(CIL.OpCodes.Add);
                                     _generator.Emit(CIL.OpCodes.Conv_U2);
+
+                                    EmitSmcFortification();
 
                                     // Calculate BCD byte 1
                                     EmitLoadRegister(instr.Param.X);
@@ -385,12 +582,16 @@ namespace Chip8_CIL.Chip8.Translation
                                     _generator.Emit(CIL.OpCodes.Add);
                                     _generator.Emit(CIL.OpCodes.Conv_U2);
 
+                                    EmitSmcFortification();
+
                                     // Calculate BCD byte 2
                                     EmitLoadRegister(instr.Param.X);
                                     _generator.Emit(CIL.OpCodes.Ldc_I4, 10);
                                     _generator.Emit(CIL.OpCodes.Rem_Un); //  MEM[I + 2] = (VX % 10)
 
                                     _generator.Emit(CIL.OpCodes.Stelem_I1); // Write byte into array
+
+                                    EmitSmcRestartCall((ushort)(addr + instr.Size));
                                     break;
                                 case OpCode.SecondaryF.Stor: // MEM[I + i] = V[i] FOR i IN 0...X
                                                              // I = I + X + 1
@@ -408,6 +609,8 @@ namespace Chip8_CIL.Chip8.Translation
                                             _generator.Emit(CIL.OpCodes.Conv_U2);
                                         }
 
+                                        EmitSmcFortification();
+
                                         EmitLoadRegister(i);
                                         _generator.Emit(CIL.OpCodes.Stelem_I1); // Write byte into array
                                     }
@@ -423,6 +626,8 @@ namespace Chip8_CIL.Chip8.Translation
                                     _generator.Emit(CIL.OpCodes.Conv_U2);
 
                                     EmitStoreRegister(Register.Id.IRegister);
+                                    EmitSmcRestartCall((ushort)(addr + instr.Size));
+
                                     break;
                                 case OpCode.SecondaryF.Read: // V[i] = MEM[I + i] FOR i IN 0...X
                                                              // I = I + X + 1
@@ -457,6 +662,7 @@ namespace Chip8_CIL.Chip8.Translation
                                     EmitStoreRegister(Register.Id.IRegister);
                                     break;
                                 default:
+                                    Debug.Assert(false);
                                     break;
                             }
                         }
@@ -468,6 +674,12 @@ namespace Chip8_CIL.Chip8.Translation
 
             private void EmitBlockTerminator(Block block)
             {
+                if ((block.EndAddr - block.TerminatingInstr.Size) == _executeStartAddr && !_executeStartLabelMarked)
+                {
+                    _generator.MarkLabel(_executeStartLabel);
+                    _executeStartLabelMarked = true;
+                }
+
                 // Parse the instruction and emit code
                 Instruction.Instruction instr = block.TerminatingInstr;
 
@@ -476,12 +688,22 @@ namespace Chip8_CIL.Chip8.Translation
                     switch (instr.Primary)
                     {
                         case OpCode.Primary.Jump: // Jumps with no successors are infloops, return if they happen
+                            _generator.Emit(CIL.OpCodes.Ldc_I4_0); // No return address
                             _generator.Emit(CIL.OpCodes.Ret);
                             return;
+                        case OpCode.Primary.Jumpi: // JMP NNN + V0
+                            _generator.Emit(CIL.OpCodes.Ldc_I4, instr.Param.NNN);
+                            EmitLoadRegister(Register.Id.V0Register);
+                            _generator.Emit(CIL.OpCodes.Add);
+                            _generator.Emit(CIL.OpCodes.Conv_U2);
+                            _generator.Emit(CIL.OpCodes.Br, _jumpTable);
+                            return;
                         case OpCode.Primary.Secondary0:
-                            if ((OpCode.Secondary0)(instr.Raw & (ushort)OpCode.Secondary0.Mask) == OpCode.Secondary0.Rts)
-                                _generator.Emit(CIL.OpCodes.Br, _returnDispatcher); // Jump to return dispatcher
-
+                            if ((OpCode.Secondary0)(instr.Raw & (ushort)OpCode.Secondary0.Mask) == OpCode.Secondary0.Tertiary0E)
+                            {
+                                if ((OpCode.Tertiary0E)(instr.Raw & (ushort)OpCode.Tertiary0E.Mask) == OpCode.Tertiary0E.Rts)
+                                    _generator.Emit(CIL.OpCodes.Br, _returnDispatcher); // Jump to return dispatcher
+                            }
                             return;
                         default:
                             return;
@@ -629,7 +851,7 @@ namespace Chip8_CIL.Chip8.Translation
                 _generator.EmitWriteLine("Fatal Error!");
                 _generator.Emit(CIL.OpCodes.Break);
 
-                // Might not work as stack could have values on it but try nonetheless
+                _generator.Emit(CIL.OpCodes.Ldc_I4_0); // No return address
                 _generator.Emit(CIL.OpCodes.Ret);
             }
 
@@ -639,36 +861,6 @@ namespace Chip8_CIL.Chip8.Translation
             private void EmitReturnDispatcher()
             {
                 _generator.MarkLabel(_returnDispatcher);
-
-                // Allocate the jump table
-                CIL.Label[] labelArray = new CIL.Label[_blocks.GetLastReturnTargetAddr() + 1];
-
-                Block target = _blocks.GetNextReturnTarget(0);
-
-                // Fill it out
-                for (int i = 0; i < labelArray.Length && target != null; i++)
-                {
-                    if (target.StartAddr == i)
-                    {
-                        // Create label for the block if needed
-                        if (!_labelMap.TryGetValue(target, out CIL.Label blockLabel))
-                        {
-                            blockLabel = _generator.DefineLabel();
-                            _labelMap[target] = blockLabel;
-                        }
-
-                        // Add to jump table
-                        labelArray[i] = blockLabel;
-
-                        // Move to checking the successor block
-                        target = _blocks.GetNextReturnTarget((ushort)(target.StartAddr + 1));
-                    }
-                    else
-                    {
-                        // A return to an address not in the return target list should never happen
-                        labelArray[i] = _errorHandler;
-                    }
-                }
 
                 // Load stack array
                 EmitLoadReturnAddressStack();
@@ -685,40 +877,76 @@ namespace Chip8_CIL.Chip8.Translation
                 // Read return address onto stack
                 _generator.Emit(CIL.OpCodes.Ldelem_U2);
 
+                _generator.Emit(CIL.OpCodes.Br, _jumpTable);
+            }
+
+            void EmitJumpTable() {
+                // Allocate the jump table
+                CIL.Label[] labelArray = new CIL.Label[Chip8System.MemorySize];
+
+                Block target = _blocks.GetNextJumpTableEntry(0);
+
+                // Fill it out
+                for (int i = 0; i < Chip8System.MemorySize; i++)
+                {
+                    if (target != null && target.StartAddr == i)
+                    {
+                        // Create label for the block if needed
+                        if (!_labelMap.TryGetValue(target, out CIL.Label blockLabel))
+                        {
+                            blockLabel = _generator.DefineLabel();
+                            _labelMap[target] = blockLabel;
+                        }
+
+                        // Add to jump table
+                        labelArray[i] = blockLabel;
+
+                        // Move to checking the successor block
+                        target = _blocks.GetNextJumpTableEntry((ushort)(target.StartAddr + 1));
+                    }
+                    else
+                    {
+                        CIL.Label blockLabel = _generator.DefineLabel();
+                        _generator.MarkLabel(blockLabel);
+                        _generator.Emit(CIL.OpCodes.Ldc_I4, i);
+                        _generator.Emit(CIL.OpCodes.Br, _restartTerminator);
+                        labelArray[i] = blockLabel;
+                    }
+                }
+
+                _generator.MarkLabel(_jumpTable);
+
                 // Emit jump table, this will switch based off the return address
                 _generator.Emit(CIL.OpCodes.Switch, labelArray);
 
                 // Use error handler for default case
                 _generator.Emit(CIL.OpCodes.Br, _errorHandler);
-
-                // Rest will be marked in the blocks
             }
 
-            public Translator.ProgramDelegate Translate()
+            public Translator.Program.ProgramDelegate Translate()
             {
 
+                _generator.Emit(CIL.OpCodes.Br, _executeStartLabel);
                 _blocks.DispatchLinear(BlockVisitor);
 
                 EmitErrorHandler();
                 EmitReturnDispatcher();
+                EmitJumpTable();
+                EmitRestartTerminator();
 
                 Type subType = _typeBuilder.CreateType();
 
 
-                return (Translator.ProgramDelegate)subType.GetMethods()[0].CreateDelegate(typeof(Translator.ProgramDelegate));
+                return (Translator.Program.ProgramDelegate)subType.GetMethods()[0].CreateDelegate(typeof(Translator.Program.ProgramDelegate));
             }
         }
 
 
-        public static Translator.ProgramDelegate Translate(BlockList blocks, CIL.ModuleBuilder moduleBuilder)
+        public static Translator.Program.ProgramDelegate Translate(BlockList blocks, CIL.ModuleBuilder moduleBuilder, uint hash, ushort executeStartAddr, bool enableSmcHardening)
         {
-            Context emitCtx = new(string.Format("PROG_{0:X}", blocks.GetStartAddr()), blocks, moduleBuilder);
+            Context emitCtx = new(string.Format("PROG_{0:X}", hash), blocks, moduleBuilder, executeStartAddr, enableSmcHardening);
 
-            Translator.ProgramDelegate del = emitCtx.Translate();
-
-
-
-            return del;
+            return emitCtx.Translate();
         }
     }
 }

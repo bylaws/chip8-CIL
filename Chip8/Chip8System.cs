@@ -1,10 +1,14 @@
-﻿using Chip8_CIL.Chip8.Translation;
+﻿using System.Collections;
+
+using Chip8_CIL.Chip8.Translation;
 
 namespace Chip8_CIL.Chip8
 {
     class Chip8System
     {
-        public const double DelayTimerIntervalMs = 1000.0 / 60;
+        public const double DelayTimerIntervalMs = 1000.0 / 120;
+        public const double SoundTimerIntervalMs = 1000.0 / 60;
+        public const double DisplayRefreshIntervalMs = 1000.0 / 30;
         public const ushort MemorySize = 0x1000;
         public const ushort RomBase = 0x200;
 
@@ -37,14 +41,13 @@ namespace Chip8_CIL.Chip8
 
         public void Run()
         {
-            Translator.ProgramDelegate translatedProgram = _translator.TranslateProgram(RomBase);
 
             InstructionHelpers instrHelpers = new(_memory, _callbacks, _logger);
 
             Register.Context ctx = new();
             ushort[] stack = new ushort[StackSize];
 
-            translatedProgram.Invoke(ref ctx, instrHelpers, _memory, stack);
+            _translator.ExecuteProgram(RomBase, ref ctx, instrHelpers, stack);
         }
     }
 }
